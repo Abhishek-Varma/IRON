@@ -4,7 +4,7 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
@@ -139,42 +139,33 @@ def my_weighted_rms_norm(
     ]
 
     # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(tensor_ty, weights_ty, tensor_ty) as (A, B, C):
-        rt.start(*my_workers)
+    in1_prods = [of.prod() for of in of_in1s]
+    in2_prods = [of.prod() for of in of_in2s]
+    out_conses = [of.cons() for of in of_out2s]
 
+    def sequence(A, B, C, in1_hs, in2_hs, out_hs):
         # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
-        tg = rt.task_group()
+        tg = TaskGroup()
 
         # Fill the input objectFIFOs with data
         for i in range(num_columns):
             for j in range(num_channels):
                 idx = i * num_channels + j
-                rt.fill(
-                    of_in1s[idx].prod(),
-                    A,
-                    taps[idx],
-                    task_group=tg,
-                )
+                in1_hs[idx].fill(A, taps[idx], group=tg)
         # Fill weights (one per channel)
         for j in range(num_channels):
-            rt.fill(
-                of_in2s[j].prod(),
-                B,
-                task_group=tg,
-            )
+            in2_hs[j].fill(B, group=tg)
         # Drain the output objectFIFOs with data
         for i in range(num_columns):
             for j in range(num_channels):
                 idx = i * num_channels + j
-                rt.drain(
-                    of_out2s[idx].cons(),
-                    C,
-                    taps[idx],
-                    wait=True,
-                    task_group=tg,
-                )
-        rt.finish_task_group(tg)
+                out_hs[idx].drain(C, taps[idx], wait=True, group=tg)
+        tg.finish()
+
+    rt = Runtime(
+        sequence,
+        [tensor_ty, weights_ty, tensor_ty, in1_prods, in2_prods, out_conses],
+    )
 
     # Place program components (assign them resources on the device) and generate an MLIR module
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt, workers=my_workers).resolve_program()

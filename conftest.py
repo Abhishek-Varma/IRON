@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
+# IRON runs on the HRX (amdxdna) host runtime. Select it before importing the
+# ``aie`` package, which reads ``NPU_RUNTIME`` at import time.
+os.environ.setdefault("NPU_RUNTIME", "hrx")
+
 import csv
 import re
 import subprocess

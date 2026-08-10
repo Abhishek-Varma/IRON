@@ -92,9 +92,9 @@ def _build_add_relu_sequence(context, dispatch, name):
 
 @pytest.mark.parametrize("size", [_ADD_RELU_SIZE])
 def test_auto_dispatch_selects_platform_default(size, aie_context):
-    """``dispatch="auto"`` must resolve to the full-ELF mode on Strix and to
-    the separate-xclbin mode on Phoenix, and produce the correct result on
-    whichever platform the test runs on."""
+    """Under the HRX runtime ``dispatch="auto"`` always resolves to the
+    separate (chained-xclbin) mode -- the only hardware dispatch HRX supports --
+    on every device generation, and must produce the correct result."""
     torch.manual_seed(0)
     a = torch.rand(size, dtype=torch.bfloat16) * 4 - 2
     b = torch.rand(size, dtype=torch.bfloat16) * 4 - 2
@@ -102,12 +102,10 @@ def test_auto_dispatch_selects_platform_default(size, aie_context):
     seq = _build_add_relu_sequence(aie_context, "auto", "infra_auto_add_relu")
     seq.compile()
 
-    expected_mode = (
-        "fused" if isinstance(aie_utils.get_current_device(), NPU2) else "separate"
-    )
+    expected_mode = "separate"
     assert seq._dispatch.name == expected_mode, (
         f"auto dispatch resolved to {seq._dispatch.name!r}, expected "
-        f"{expected_mode!r} on this device"
+        f"{expected_mode!r} under the HRX runtime"
     )
 
     run = seq.get_callable()
@@ -179,15 +177,13 @@ def _run_add_relu(context, dispatch, a, b, name):
     return run.get_buffer("out").torch_view()[:_ADD_RELU_SIZE].clone()
 
 
-@pytest.mark.parametrize("dispatch", ["separate", "fused", "compare"])
+@pytest.mark.parametrize("dispatch", ["separate", "compare"])
 def test_dispatch_modes_bit_identical(dispatch, aie_context):
-    """add -> relu must yield byte-for-byte identical output across every NPU
+    """add -> relu must yield byte-for-byte identical output across every HRX
     dispatch mode: the compiled kernels are the same, so only the dispatch
-    mechanism differs. The ``separate`` mode is the baseline (it runs on every
-    platform)."""
-    if dispatch == "fused" and not isinstance(aie_utils.get_current_device(), NPU2):
-        pytest.skip("fused (single-ELF) dispatch requires NPU2")
-
+    mechanism differs. The ``separate`` mode is the baseline. (The XRT-only
+    ``fused`` single-ELF mode is not supported on HRX -- see
+    ``test_fused_dispatch_unsupported_on_hrx``.)"""
     torch.manual_seed(0)
     a = torch.rand(_ADD_RELU_SIZE, dtype=torch.bfloat16) * 4 - 2
     b = torch.rand(_ADD_RELU_SIZE, dtype=torch.bfloat16) * 4 - 2
@@ -201,6 +197,15 @@ def test_dispatch_modes_bit_identical(dispatch, aie_context):
         f"dispatch={dispatch!r} output is not bit-identical to the separate "
         f"baseline"
     )
+
+
+def test_fused_dispatch_unsupported_on_hrx(aie_context):
+    """The fused single full-ELF dispatch is XRT-only. Under the HRX runtime it
+    must fail loudly with an actionable ``NotImplementedError`` (pointing the
+    user at ``dispatch='separate'``) rather than silently misbehaving."""
+    seq = _build_add_relu_sequence(aie_context, "fused", "infra_fused_unsupported")
+    with pytest.raises(NotImplementedError, match="XRT-only"):
+        seq.compile()
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@
 from ml_dtypes import bfloat16
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -82,36 +82,26 @@ def binary_elementwise_design(
     ]
 
     # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(tensor_ty, tensor_ty, tensor_ty) as (A, B, C):
-        rt.start(*my_workers)
+    in1_prods = [of.prod() for of in of_in1s]
+    in2_prods = [of.prod() for of in of_in2s]
+    out_conses = [of.cons() for of in of_outs]
 
-        tg = rt.task_group()
+    def sequence(A, B, C, in1_hs, in2_hs, out_hs):
+        tg = TaskGroup()
 
         # Fill the input objectFIFOs with data
         for i in range(num_columns):
-            rt.fill(
-                of_in1s[i].prod(),
-                A,
-                taps[i],
-                task_group=tg,
-            )
-            rt.fill(
-                of_in2s[i].prod(),
-                B,
-                taps[i],
-                task_group=tg,
-            )
+            in1_hs[i].fill(A, taps[i], group=tg)
+            in2_hs[i].fill(B, taps[i], group=tg)
         # Drain the output objectFIFOs with data
         for i in range(num_columns):
-            rt.drain(
-                of_outs[i].cons(),
-                C,
-                taps[i],
-                wait=True,
-                task_group=tg,
-            )
-        rt.finish_task_group(tg)
+            out_hs[i].drain(C, taps[i], wait=True, group=tg)
+        tg.finish()
+
+    rt = Runtime(
+        sequence,
+        [tensor_ty, tensor_ty, tensor_ty, in1_prods, in2_prods, out_conses],
+    )
 
     # Place program components and generate an MLIR module
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt, workers=my_workers).resolve_program()

@@ -8,7 +8,7 @@ import aie.dialects.index as index
 from aie.dialects.aie import T
 from aie.helpers.dialects.scf import _for as range_
 from aie.helpers.taplib import TensorAccessPattern
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 
 """
 Matrix-vector design
@@ -232,33 +232,31 @@ def my_matvec(
             for col in range(cols)
         ]
 
-    rt = Runtime()
-    with rt.sequence(L3_A_ty, L3_B_ty, L3_C_ty) as (A, B, C):
-        rt.start(*workers)
-        tg_b = rt.task_group()
+    A_prods = [f.prod() for f in A_L3L1_fifos]
+    B_prods = [f.prod() for f in B_L3L1_fifos]
+    C_conses = [f.cons() for f in C_L1L3_fifos]
+
+    def sequence(A, B, C, A_hs, B_hs, C_hs):
+        tg_b = TaskGroup()
         for col in range(cols):
             # Simple linear transfer of B, includes all batches in sequence
-            rt.fill(B_L3L1_fifos[col].prod(), B, B_tap, task_group=tg_b)
+            B_hs[col].fill(B, B_tap, group=tg_b)
         # Coalesced: one iterated BD per column covers all batches (num_waits==1, a
         # single drain wait for the whole column). Fallback (incl. num_batches==1): the
         # stock per-batch unroll (num_waits==num_batches, one wait per batch). The fills
         # and drains are otherwise identical; only the TAP and the wait count differ.
         num_waits = 1 if coalesce else num_batches
         for w in range(num_waits):
-            tg_ac = rt.task_group()
+            tg_ac = TaskGroup()
             for col in range(cols):
                 a_tap = A_taps_coalesced[col] if coalesce else A_taps[col][w]
-                rt.fill(A_L3L1_fifos[col].prod(), A, a_tap, task_group=tg_ac)
+                A_hs[col].fill(A, a_tap, group=tg_ac)
             for col in range(cols):
                 c_tap = C_taps_coalesced[col] if coalesce else C_taps[col][w]
-                rt.drain(
-                    C_L1L3_fifos[col].cons(),
-                    C,
-                    c_tap,
-                    task_group=tg_ac,
-                    wait=True,
-                )
-            rt.finish_task_group(tg_ac)
-        rt.finish_task_group(tg_b)
+                C_hs[col].drain(C, c_tap, wait=True, group=tg_ac)
+            tg_ac.finish()
+        tg_b.finish()
 
-    return Program(dev, rt).resolve_program()
+    rt = Runtime(sequence, [L3_A_ty, L3_B_ty, L3_C_ty, A_prods, B_prods, C_conses])
+
+    return Program(dev, rt, workers=workers).resolve_program()

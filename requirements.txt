@@ -5,6 +5,12 @@
 # we add them as additional indices here. Furthermore, we want the CPU-only
 # version of torch (don't need CUDA), so we give this index precedence over the
 # main PyPI. These indices are consulted in order of precedence by pip.
+#
+# NOTE: IRON dispatches through the HRX (amdxdna / libhrx) host runtime, selected
+# automatically via NPU_RUNTIME=hrx. The mlir_aie build used here must include
+# the HRX host-runtime backend (aie.utils.hostruntime.hrxruntime, from mlir-aie
+# PR #3347), and libhrx.so must be provisioned separately and discoverable
+# (HRX_DIR / LIBHRX_DIR / LD_LIBRARY_PATH). No XRT userspace is required.
 --index-url https://download.pytorch.org/whl/cpu
 --extra-index-url https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4
 --extra-index-url https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly

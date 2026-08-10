@@ -95,9 +95,12 @@ If starting from `Ubuntu 24.04` you may need to update the Linux kernel to 6.11+
   sudo reboot
   ```
 
-1. Install XDNA™ Driver and XRT:
+1. Install the XDNA™ Driver:
 
     > [Instructions from mlir-aie repository](https://github.com/Xilinx/mlir-aie?tab=readme-ov-file#build-and-install-the-xdna-driver-and-xrt)
+    >
+    > IRON dispatches through the HRX (`amdxdna` / `libhrx`) host runtime, not
+    > XRT. You only need the XDNA kernel driver, not the XRT userspace.
 
 1. Install the packages needed for IRON and MLIR-AIE:
 
@@ -114,10 +117,12 @@ If starting from `Ubuntu 24.04` you may need to update the Linux kernel to 6.11+
    python3 -m pip install --upgrade pip
    ```
 
-1. Source XRT (installed in step 1):
+1. Make HRX (`libhrx.so`) discoverable so the runtime can dispatch to the NPU:
    ```bash
-   source /opt/xilinx/xrt/setup.sh
+   # Point at your HRX install (adjust to your provisioned location).
+   export LD_LIBRARY_PATH=/path/to/hrx/lib:${LD_LIBRARY_PATH}
    ```
+   IRON selects the HRX backend automatically (`NPU_RUNTIME=hrx`).
 
 1. Install required Python packages (from requirements.txt):
    ```bash
@@ -138,8 +143,8 @@ All available operators can be found in `iron/operators`. These each contain:
 - `reference.py`: A reference CPU implementation to validate the correctness of the NPU implementation.
 - `test.py`: An end-to-end test that instantiates and builds the operator, runs it and verifies its outputs against the reference.
 
-> NOTE: Be sure the XRT setup script has been sourced and the Python environment is activated:
->       `source /opt/xilinx/xrt/setup.sh`
+> NOTE: Be sure `libhrx.so` is discoverable and the Python environment is activated:
+>       `export LD_LIBRARY_PATH=/path/to/hrx/lib:${LD_LIBRARY_PATH}`
 >       `source /path/to/ironenv/bin/activate`
 
 To build and test all the operators:
@@ -202,7 +207,7 @@ IRON uses a three-layer architecture:
 
 3. **Common Infrastructure** (`iron/common/`): Compilation, device management, and utilities
    - MLIR-AIE compilation pipeline
-   - XRT runtime integration
+   - HRX (`amdxdna` / `libhrx`) runtime integration
    - Operator fusion framework
 
 ## Performance

@@ -14,15 +14,17 @@ IRON is a close-to-metal Python API for AMD Ryzen™ AI NPUs (XDNA architecture)
 **Key Technologies:**
 
 - **MLIR-AIE**: Dialect for programming AMD AI Engines (AIE) array architectures
-- **XRT (Xilinx Runtime)**: Low-level runtime for interfacing with NPU hardware
+- **HRX (amdxdna / libhrx)**: Low-level host runtime for interfacing with NPU hardware. IRON dispatches exclusively through HRX (`NPU_RUNTIME=hrx`); the XRT host stack is no longer used.
 - **Target Hardware**: AMD Ryzen AI NPUs (AIE2/AIE2P architectures - NPU1/NPU2)
 - **Primary Datatype**: bfloat16
 
 ## Environment Setup
 
 ```bash
-# 1. Source XRT (required for all operations)
-source /opt/xilinx/xrt/setup.sh
+# 1. Provision HRX (libhrx) and make it discoverable. IRON selects the HRX
+#    backend automatically (NPU_RUNTIME=hrx); ensure libhrx.so is on the
+#    library path (set HRX_DIR / LIBHRX_DIR or add it to LD_LIBRARY_PATH).
+export LD_LIBRARY_PATH=/path/to/hrx/lib:${LD_LIBRARY_PATH}
 
 # 2. Create virtual environment (may already be present)
 python3 -m venv ironenv
@@ -35,7 +37,10 @@ python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 ```
 
-**Note:** XRT must be sourced before running any tests or operators.
+**Note:** The `aie`/mlir-aie package on `sys.path` must be a build that includes
+the HRX host-runtime backend (`aie.utils.hostruntime.hrxruntime`, from mlir-aie
+PR #3347), and `libhrx.so` must be discoverable before running any tests or
+operators. IRON sets `NPU_RUNTIME=hrx` for you (via `iron.common` / `conftest`).
 
 ### Build Directory
 
@@ -141,7 +146,8 @@ reuse lint
    - `base.py`: Base classes (`AIEOperatorBase`, `MLIROperator`, `CompositeOperator`)
    - `compilation/`: Compilation artifact system (MLIR → xclbin)
    - `fusion.py`: Operator sequencing framework (`OperatorSequence`)
-   - `device_manager.py`: XRT device initialization and management (singleton pattern)
+   - Device/runtime management is delegated to the `aie` package's HRX host
+     runtime (`aie.utils.DefaultNPURuntime`, a process-wide singleton)
    - `context.py`: `AIEContext` for operator compilation/execution
    - `utils.py`: Helper functions (`torch_to_numpy`, `numpy_to_torch`)
    - `test_utils.py`: Test utilities (`verify_buffer`, `nearly_equal`)
@@ -188,14 +194,16 @@ xclbin (NPU binary) + insts.bin (instruction sequence)
 
 - Default build directory: `build/` in current working directory
 - Compilation rules: Defines pipeline from Python → MLIR → xclbin
-- Device manager: Singleton for XRT resource sharing
+- Runtime: dispatch is delegated to the HRX host runtime in the `aie` package
 - Use `AIEContext(build_dir="...", mlir_verbose=True)` for custom settings
 
-**Device Manager**: Singleton that manages XRT resources
+**Host Runtime (HRX)**: `aie.utils.DefaultNPURuntime` (a `CachedHRXRuntime`)
 
-- Automatically initializes `pyxrt.device(0)`
-- Caches contexts and kernels per xclbin path
-- Shared across all operators to avoid resource conflicts
+- Process-wide singleton over `libhrx` (amdxdna); loads amdxdna executables
+  from the compiled `xclbin` + `insts.bin` and dispatches them
+- Caches loaded executables; shared across all operators to avoid rebuilds
+- Buffers are `HRXTensor`s (persistent-mapped device BOs); create them via the
+  runtime-neutral `iron.tensor` / `aie.utils.tensor` factory
 
 ## Hardware Constraints
 
@@ -387,13 +395,9 @@ These utilities handle bfloat16 conversion correctly (avoiding float32 intermedi
 
 ### Debug Mode
 
-Disable XRT runlist for easier debugging (executes kernels individually):
-
-```python
-context = AIEContext(use_runlist=False)
-```
-
-This sacrifices performance but makes it easier to identify which kernel fails.
+For an `OperatorSequence`, use `dispatch="reference"` (pure-CPU per-op) or
+`dispatch="compare"` (runs each step on the NPU and checks it against the CPU
+reference) to isolate which operator misbehaves.
 
 ### Verbose MLIR Output
 
@@ -443,9 +447,10 @@ logging.basicConfig(level=logging.DEBUG)
 
 ### Common Issues
 
-**"No XRT device found"**
+**"libhrx.so could not be located" / "No HRX device found"**
 
-- Ensure `source /opt/xilinx/xrt/setup.sh` was run
+- Ensure `libhrx.so` is discoverable (`HRX_DIR` / `LIBHRX_DIR` / `LD_LIBRARY_PATH`)
+- Check the `aie` package includes the HRX backend: `python -c "import aie.utils as u; print(u.DEFAULT_TENSOR_CLASS)"` should print `HRXTensor`
 - Check XDNA driver is installed: `lsmod | grep amdxdna`
 
 **"Kernel not found" or "Symbol not defined"**
@@ -477,7 +482,8 @@ logging.basicConfig(level=logging.DEBUG)
 
 - NPU1 supports 1-4 columns only
 - NPU2 supports up to 8 columns
-- Device type is auto-detected via XRT
+- Device generation is auto-detected by the HRX runtime (override with
+  `IRON_HRX_DEVICE=npu1|npu2`)
 
 **Kernel compilation failures**
 

@@ -8,7 +8,7 @@ import torch
 import aie.utils as aie_utils
 from ml_dtypes import bfloat16
 from .base import AIEOperatorBase
-from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
+from aie.utils import DEFAULT_TENSOR_CLASS, tensor
 
 torch_dtype_map = {
     "bf16": torch.bfloat16,
@@ -173,28 +173,28 @@ def run_test(
                 name, data = next(input_iter)
             except StopIteration:
                 raise ValueError("Not enough input buffers provided for arg spec")
-            buf = XRTTensor.from_torch(data)
+            buf = DEFAULT_TENSOR_CLASS.from_torch(data)
             args.append(buf)
-            total_bytes += buf.buffer_object().size()
+            total_bytes += buf.nbytes
         elif spec.direction == "out":
             try:
                 name, expected = next(output_iter)
             except StopIteration:
                 raise ValueError("Not enough output buffers provided for arg spec")
-            buf = XRTTensor(spec.shape, dtype=spec.dtype)
+            buf = tensor(spec.shape, dtype=spec.dtype)
             args.append(buf)
             output_map[name] = buf
-            total_bytes += buf.buffer_object().size()
+            total_bytes += buf.nbytes
         elif spec.direction == "inout":
             try:
                 name, data = next(input_iter)
             except StopIteration:
                 raise ValueError("Not enough input buffers provided for inout arg spec")
-            buf = XRTTensor.from_torch(data)
+            buf = DEFAULT_TENSOR_CLASS.from_torch(data)
             args.append(buf)
             output_map[name] = buf
             inout_names.append(name)
-            total_bytes += buf.buffer_object().size()
+            total_bytes += buf.nbytes
         else:
             raise ValueError(f"Unsupported direction: {spec.direction}")
 

@@ -516,7 +516,6 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 str(self.aiecc_path),
                 "-v",
                 f"-j{os.environ.get('AIECC_JOBS', '1')}",
-                "--no-compile-host",
             ]
             if self.use_chess:
                 compile_cmd += [
@@ -525,8 +524,6 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
                 ]
             else:
                 compile_cmd += [
-                    "--no-xchesscc",
-                    "--no-xbridge",
                     "--peano",
                     str(self.peano_dir),
                 ]
@@ -566,11 +563,17 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
         commands = []
         # Now we know for each mlir source if we need to generate an xclbin, an insts.bin or both for it
         for mlir_source in mlir_sources:
+            # IRON targets the aiecc "declarative driver" (mlir-aie's current
+            # aiecc): outputs are requested with `--get-<name>` and the host
+            # program is never compiled unless host cc args are passed after
+            # `--`, so the legacy `--no-compile-host` / `--no-compile` flags are
+            # gone. `--fold-ddr-addr-offset=false` selects the HRX host-runtime
+            # ABI (raw DDR offsets; libhrx adds the AIE DDR aperture offset for
+            # all args) that the HRX backend expects.
             compile_cmd = [
                 str(self.aiecc_path),
                 "-v",
                 f"-j{os.environ.get('AIECC_JOBS', '1')}",
-                "--no-compile-host",
             ]
             if self.use_chess:
                 compile_cmd += [
@@ -579,13 +582,11 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 ]
             else:
                 compile_cmd += [
-                    "--no-xchesscc",
-                    "--no-xbridge",
-                    "--peano",
-                    str(self.peano_dir),
+                    f"--peano={self.peano_dir}",
                 ]
             compile_cmd += [
                 "--dynamic-objFifos",
+                "--fold-ddr-addr-offset=false",
             ]
             do_compile_xclbin = mlir_source in mlir_sources_to_xclbins
             do_compile_insts_bin = mlir_source in mlir_sources_to_insts
@@ -594,7 +595,7 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                     0
                 ]  # TODO: this does not handle the case of multiple xclbins with different kernel names or flags from the same MLIR
                 compile_cmd += first_xclbin.extra_flags + [
-                    "--aie-generate-xclbin",
+                    "--get-xclbin",
                     "--xclbin-name=" + os.path.abspath(first_xclbin.filename),
                     "--xclbin-kernel-name=" + first_xclbin.kernel_name,
                 ]
@@ -607,10 +608,8 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 first_insts_bin = mlir_sources_to_insts[mlir_source][
                     0
                 ]  # TODO: this does not handle the case of multiple insts.bins with different flags from the same MLIR
-                if not do_compile_xclbin:
-                    compile_cmd += ["--no-compile"]
                 compile_cmd += first_insts_bin.extra_flags + [
-                    "--aie-generate-npu-insts",
+                    "--get-npu-insts",
                     "--npu-insts-name=" + os.path.abspath(first_insts_bin.filename),
                 ]
             compile_cmd += [os.path.abspath(mlir_source.filename)]

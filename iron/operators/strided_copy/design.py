@@ -11,7 +11,8 @@ input[0, :, 0] -> output[:, 0, 0]
 import numpy as np
 
 from aie.dialects.aiex import TensorAccessPattern
-from aie.iron import ObjectFifo, ScratchpadParameter, Program, Runtime
+from aie.iron import ObjectFifo, ScratchpadParameter, Program, Runtime, TaskGroup
+from aie.iron.runtime.runtime import sync_parameters
 
 
 def strided_copy(
@@ -130,27 +131,29 @@ def strided_copy(
         for c in range(num_aie_channels)
     ]
 
-    rt = Runtime()
-    with rt.sequence(inp_ty, out_ty) as (inp, out):
+    in_prods = [f.prod() for f in fifos_in]
+    out_conses = [f.cons() for f in fifos_out]
+
+    def sequence(inp, out, in_hs, out_hs):
         if in_offset_param is not None or out_offset_param is not None:
-            rt.sync_parameters()
-        tg = rt.task_group()
+            sync_parameters()
+        tg = TaskGroup()
         for c in range(num_aie_channels):
-            rt.fill(
-                fifos_in[c].prod(),
+            in_hs[c].fill(
                 inp,
                 input_taps[c],
-                task_group=tg,
+                group=tg,
                 offset_parameter=in_offset_param,
             )
-            rt.drain(
-                fifos_out[c].cons(),
+            out_hs[c].drain(
                 out,
                 output_taps[c],
-                task_group=tg,
                 wait=True,
+                group=tg,
                 offset_parameter=out_offset_param,
             )
-        rt.finish_task_group(tg)
+        tg.finish()
+
+    rt = Runtime(sequence, [inp_ty, out_ty, in_prods, out_conses])
 
     return Program(dev, rt).resolve_program()

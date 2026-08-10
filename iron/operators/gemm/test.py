@@ -9,7 +9,7 @@ import pytest
 import aie.utils as aie_utils
 import torch
 import ml_dtypes
-from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
+from aie.utils import DEFAULT_TENSOR_CLASS, tensor
 
 from iron.operators.gemm.op import GEMM
 from iron.operators.gemm.reference import generate_golden_reference
@@ -164,10 +164,10 @@ def test_gemm(
         # Partition B using the operator method (handles slicing and padding)
         B_parts = compilable.partition_B(B_full_np, partition_N)
 
-        # Create A XRTTensor (shared across all partitions)
-        A_buf = XRTTensor.from_torch(golden_ref["input"].flatten())
+        # Create A tensor (shared across all partitions)
+        A_buf = DEFAULT_TENSOR_CLASS.from_torch(golden_ref["input"].flatten())
 
-        # Allocate per-partition B and C XRTTensors
+        # Allocate per-partition B and C tensors
         arg_spec = compilable.get_arg_spec()
         c_shape = arg_spec[2].shape
         c_dtype = arg_spec[2].dtype
@@ -180,8 +180,8 @@ def test_gemm(
                 .view(torch.bfloat16)
                 .flatten()
             )
-            B_bufs.append(XRTTensor.from_torch(b_torch))
-            C_bufs.append(XRTTensor(c_shape, dtype=c_dtype))
+            B_bufs.append(DEFAULT_TENSOR_CLASS.from_torch(b_torch))
+            C_bufs.append(tensor(c_shape, dtype=c_dtype))
 
         # Run each partition
         start_time = time.perf_counter()

@@ -14,6 +14,7 @@ from aie.iron import (
     Program,
     Buffer,
     Runtime,
+    TaskGroup,
     Worker,
     WorkerRuntimeBarrier,
     str_to_dtype,
@@ -550,27 +551,38 @@ def my_matmul(
         )
 
     # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
-        rt.start(*workers)
+    A_prods = [
+        A_l3l2_fifos[i].prod(tile=Tile(2 * i if n_aie_cols == 8 else i, 0))
+        for i in range(n_shim_mem_A)
+    ]
+    B_prods = [B_l3l2_fifos[col].prod(tile=Tile(col, 0)) for col in range(n_aie_cols)]
+    C_conses = [C_l2l3_fifos[col].cons(tile=Tile(col, 0)) for col in range(n_aie_cols)]
 
-        # Set runtime parameters
-        def set_rtps(*args):
-            for row, rtps_row in enumerate(args):
-                for col, rtp_row_col in enumerate(rtps_row):
-                    rtp_row_col[0] = K_div_k
-                    rtp_row_col[1] = n_c_row_tiles_per_core * n_c_col_tiles_per_core
+    def sequence(A, B, C, A_hs, B_hs, C_hs):
+        # Adapters bridging the old rt.fill/rt.drain calls (which passed the
+        # ObjectFifo handle + an explicit shim tile=) to the new handle-based
+        # API, where the shim tile is bound on the handle above.
+        def _fill(h, src, tap=None, task_group=None, tile=None):
+            return h.fill(src, tap=tap, group=task_group)
 
-        rt.inline_ops(set_rtps, rtps)
+        def _drain(h, dst, tap=None, wait=False, task_group=None, tile=None):
+            return h.drain(dst, tap=tap, wait=wait, group=task_group)
+
+        # Set runtime parameters. The body is emitted after worker Buffers are
+        # resolved, so these write-RTP buffers can be poked directly here.
+        for rtps_row in rtps:
+            for rtp_row_col in rtps_row:
+                rtp_row_col[0] = K_div_k
+                rtp_row_col[1] = n_c_row_tiles_per_core * n_c_col_tiles_per_core
 
         # Set the barriers to 1 to allow the worker to read the
         # runtime parameters and start the computation
         for row in range(n_aie_rows):
             for col in range(n_aie_cols):
-                rt.set_barrier(workerBarriers[row][col], 1)
+                workerBarriers[row][col].set(1)
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
-        tg = rt.task_group()
+        tg = TaskGroup()
         for tb in range(ceildiv(n_c_row_tiles_per_core, tb_max_n_rows)):
             for pingpong in [0, 1]:
                 row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
@@ -628,8 +640,8 @@ def my_matmul(
                         # This line does not change MLIR output at all - it's just for recording data movement
                         C_taps.append(C_tile)
 
-                        rt.drain(
-                            C_l2l3_fifos[col].cons(),
+                        _drain(
+                            C_hs[col],
                             C,
                             tap=C_tile,
                             wait=True,
@@ -683,8 +695,8 @@ def my_matmul(
                                 sizes=C_sizes,
                                 strides=C_strides,
                             )
-                            rt.drain(
-                                C_l2l3_fifos[col].cons(),
+                            _drain(
+                                C_hs[col],
                                 C,
                                 tap=C_tile,
                                 wait=True,
@@ -718,8 +730,8 @@ def my_matmul(
 
                         # always equal to n_aie_rows since we have n_aie_rows row tiles for matrix A
                         if col < n_aie_rows:
-                            rt.fill(
-                                A_l3l2_fifos[col].prod(),
+                            _fill(
+                                A_hs[col],
                                 A,
                                 tap=A_tiles[tile_offset],
                                 task_group=tg,
@@ -749,8 +761,8 @@ def my_matmul(
                         #     |0011    0011    |
                         #     |0011    0011    |
                         #      ----------------
-                        rt.fill(
-                            B_l3l2_fifos[col].prod(),
+                        _fill(
+                            B_hs[col],
                             B,
                             tap=B_tiles[col],
                             task_group=tg,
@@ -761,9 +773,18 @@ def my_matmul(
                         A_taps.append(A_tiles[tile_offset])
                         B_taps.append(B_tiles[col])
                 if tb > 0 or (tb == 0 and pingpong > 0):
-                    rt.finish_task_group(tg)
-                    tg = rt.task_group()
-        rt.finish_task_group(tg)
+                    tg.finish()
+                    tg = TaskGroup()
+        tg.finish()
+
+    rt = Runtime(sequence, [A_ty, B_ty, C_ty, A_prods, B_prods, C_conses])
+
+    # Create the program from the device type and runtime.  resolve_program()
+    # runs the sequence body, which populates the closure A_taps/B_taps/C_taps
+    # lists as a side effect; the generate_taps path needs that, so resolve
+    # first and branch afterwards.
+    my_program = Program(dev_ty, rt, workers=workers)
+    module = my_program.resolve_program()
 
     if generate_taps:
         # If generate taps is true, return a representation of tensor access patterns
@@ -774,11 +795,6 @@ def my_matmul(
             TensorAccessSequence.from_taps(C_taps),
         )
 
-    # Create the program from the device type and runtime
-    my_program = Program(dev_ty, rt)
-
-    # Place components (assign them resources on the device) and generate an MLIR module
-    module = my_program.resolve_program()
     return module
 
 

@@ -1,20 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import hashlib
 import logging
 import time
-from pathlib import Path
 import numpy as np
 import ml_dtypes
-import pyxrt
 import torch
 from . import compilation as comp
 from .base import AIEOperatorBase, MLIROperator
-from .utils import XRTSubBuffer
 import aie.utils as aie_utils
-from aie.iron.device import NPU2
-from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
 from aie.utils.hostruntime.tensor_class import CPUOnlyTensor
 from aie.utils.npukernel import NPUKernel
 
@@ -56,27 +50,39 @@ class SequenceDispatch:
 
 
 class AutoDispatch(SequenceDispatch):
-    """Selects the platform default: full-ELF on NPU2, chained-xclbin elsewhere."""
+    """Selects the platform default.
+
+    Under the HRX (amdxdna) runtime the only supported hardware dispatch is the
+    chained-xclbin path (one xclbin+insts per operator, batched into a single
+    HRX ``run_chain``), so ``auto`` always resolves to :class:`SeparateDispatch`
+    regardless of device generation.
+    """
 
     name = "auto"
 
     def resolve(self, device):
-        if isinstance(device, NPU2):
-            return FusedDispatch()
         return SeparateDispatch()
 
 
 class FusedDispatch(SequenceDispatch):
-    """Single-ELF dispatch (NPU2 only): all operators fused into one ELF."""
+    """Single-ELF dispatch (NPU2 only), XRT-only -- unsupported under HRX.
+
+    The fused single-ELF path relied on XRT's ``hw_context`` / ``run.set_arg``
+    mechanism to bind three consolidated input/output/scratch buffers to one
+    full ELF. HRX exposes no equivalent, so this mode is not available on the
+    HRX runtime. Use ``dispatch='separate'`` (the default via ``auto``), which
+    batches per-operator dispatches into a single HRX ``run_chain``.
+    """
 
     name = "fused"
 
     def resolve(self, device):
-        if not isinstance(device, NPU2):
-            raise RuntimeError(
-                "dispatch='fused' requires NPU2; NPU1 has no full-ELF dispatch"
-            )
-        return self
+        raise NotImplementedError(
+            "dispatch='fused' (single full-ELF) is XRT-only and is not supported "
+            "on the HRX runtime. Use dispatch='separate' (or the default "
+            "dispatch='auto'), which batches per-operator dispatches into one "
+            "HRX run_chain."
+        )
 
     def set_up_artifacts(self, seq):
         mlir_artifact = self.build_fused_mlir(seq)
@@ -135,50 +141,39 @@ class FusedDispatch(SequenceDispatch):
 
 
 class SeparateDispatch(SequenceDispatch):
-    """Chained-xclbin dispatch: one xclbin+insts per unique operator, linked
-    via ``--xclbin-input`` and invoked sequentially. Owns the compiled
+    """Chained-dispatch: one independent xclbin+insts per unique operator.
+
+    Under HRX each operator is packaged as its own amdxdna executable (exactly
+    like a single-operator dispatch); the runtime callable loads them all and
+    submits the runlist as one batched HRX ``run_chain`` (an ``ERT_CMD_CHAIN``),
+    so a producer -> consumer buffer handoff between consecutive operators is
+    honored within a single submit. Unlike the old XRT path, the per-operator
+    xclbins are *not* linked via ``--xclbin-input``; batching happens at dispatch
+    time in the HRX runtime, not at packaging time. Owns the compiled
     per-operator xclbin/insts maps consumed by the runtime callable.
     """
 
     name = "separate"
 
     def __init__(self):
-        self.combined_xclbin = None
         self.op_xclbin_map = {}  # id(op) -> xclbin artifact
         self.op_insts_map = {}  # id(op) -> insts artifact
         self.op_kernel_name_map = {}  # id(op) -> kernel_name
 
     def set_up_artifacts(self, seq):
-        # Short hash keeps kernel names under xclbinutil's 64-char "name:name" limit.
-        name_hash = hashlib.sha1(seq.name.encode()).hexdigest()[:6]
-
         artifacts = []
-        prev_xclbin = None
         for idx, op in enumerate(seq.unique_operators()):
-            op_label = f"f{name_hash}_op{idx}"
-            kernel_id = f"0x{0x901 + idx:x}"
-
+            # Unique per-operator prefix so two operators in one sequence never
+            # collide on artifact filenames. Each op is a self-contained
+            # xclbin+insts (its own amdxdna executable at runtime).
+            op_label = f"seq_op{idx}"
             xclbin, insts = op.get_artifacts(prefix=f"{op_label}_")
-            # Copy so we don't mutate the (possibly aliased) shared flags list.
-            xclbin.extra_flags = list(xclbin.extra_flags) + [
-                f"--xclbin-instance-name={op_label}",
-                f"--xclbin-kernel-id={kernel_id}",
-            ]
-            xclbin.kernel_name = op_label
-
-            if prev_xclbin is not None:
-                xclbin.xclbin_input = prev_xclbin
-                xclbin.dependencies.add(prev_xclbin)
-
-            artifacts.append(insts)
+            artifacts.extend([xclbin, insts])
             self.op_xclbin_map[id(op)] = xclbin
             self.op_insts_map[id(op)] = insts
-            self.op_kernel_name_map[id(op)] = op_label
-            prev_xclbin = xclbin
-
-        # The last xclbin in the chain carries all the linked instances.
-        artifacts.append(prev_xclbin)
-        self.combined_xclbin = prev_xclbin
+            # get_artifacts leaves the default kernel/export name ("MLIR_AIE"),
+            # which is what HRX looks up per executable.
+            self.op_kernel_name_map[id(op)] = xclbin.kernel_name
         seq.add_artifacts(artifacts)
 
     def make_callable(self, seq):
@@ -242,13 +237,13 @@ class OperatorSequence(AIEOperatorBase):
     Args:
         dispatch: Dispatch strategy, given either as a mode name or as a
             :class:`SequenceDispatch` instance. Recognised names:
-            ``"auto"`` (default) selects ``"fused"`` on NPU2 and
-            ``"separate"`` on NPU1.  ``"fused"`` uses a single-ELF
-            dispatch (requires NPU2).  ``"separate"`` compiles each
-            sub-operator to its own xclbin and invokes them sequentially.
+            ``"auto"`` (default) resolves to ``"separate"`` on the HRX runtime.
+            ``"separate"`` compiles each sub-operator to its own xclbin+insts
+            and submits the runlist as a single batched HRX ``run_chain``.
+            ``"fused"`` (single full-ELF) is XRT-only and raises on HRX.
             ``"reference"`` runs only the per-operator CPU reference
             implementations (no NPU compilation/dispatch).  ``"compare"``
-            runs the ``"separate"`` xclbin path and, after each NPU step,
+            runs the ``"separate"`` path step-by-step and, after each NPU step,
             also runs the operator's CPU reference on the NPU-produced
             inputs and logs the deviation for testing/debugging.  Pass a
             :class:`CompareDispatch` instance to tune the compare tolerances.
@@ -502,103 +497,22 @@ class SequenceCallable:
 
 
 class SequenceFullELFCallable(SequenceCallable):
-    """Single-ELF dispatch (NPU2): every operator shares three consolidated
-    input/output/scratch buffers addressed by offset. ``get_buffer`` returns a
-    sub-view into whichever consolidated buffer holds the named argument.
+    """Single-ELF dispatch (NPU2), XRT-only -- unsupported under HRX.
+
+    This callable bound three consolidated input/output/scratch buffers to one
+    full ELF via XRT's ``hw_context`` / ``run.set_arg``. HRX exposes no
+    equivalent binding-by-offset-into-a-shared-arena mechanism, so it is not
+    available on the HRX runtime. It is only reachable via
+    :class:`FusedDispatch`, whose ``resolve`` already raises; this constructor
+    fails loudly as a defensive backstop.
     """
 
-    def __init__(self, op, device_name="main", sequence_name="sequence"):
-        self.device_name = device_name
-        self.sequence_name = sequence_name
-
-        assert isinstance(op.artifacts[0], comp.FullElfArtifact)
-        xrt_elf = pyxrt.elf(str(op.artifacts[0].filename))
-        xrt_context = pyxrt.hw_context(aie_utils.DefaultNPURuntime._device, xrt_elf)
-        self.xrt_kernel = pyxrt.ext.kernel(
-            xrt_context, f"{self.device_name}:{self.sequence_name}"
+    def __init__(self, op, *args, **kwargs):
+        raise NotImplementedError(
+            "The fused single full-ELF dispatch is XRT-only and is not supported "
+            "on the HRX runtime. Use dispatch='separate' (or the default "
+            "dispatch='auto')."
         )
-
-        super().__init__(op)
-
-        # Persistent run handle: reused across dispatches so that the
-        # ctrl-scratchpad backing buffer (and any ParameterScratchpad state
-        # built on top of it) stays valid across calls.
-        self.run_handle = pyxrt.run(self.xrt_kernel)
-        self.run_handle.set_arg(0, self.input_buffer.buffer_object())
-        self.run_handle.set_arg(1, self.output_buffer.buffer_object())
-        self.run_handle.set_arg(2, self.scratch_buffer.buffer_object())
-
-        self._params = None
-
-    @property
-    def params(self):
-        """Lazy ParameterScratchpad bound to this ELF's ctrl scratchpad BO.
-
-        The ``params.txt`` describing the runtime parameters is written by
-        ``aie-lower-parameters`` into the ``<mlir>.prj`` project directory next
-        to the fused MLIR source. Returns ``None`` if the sequence declared no
-        runtime parameters (in which case the file is not written).
-        """
-        if self._params is not None:
-            return self._params
-        mlir_filename = self.op.artifacts[0].mlir_input.filename
-        params_path = Path(mlir_filename + ".prj") / "params.txt"
-        if not params_path.exists():
-            return None
-        from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import (
-            ParameterScratchpad,
-        )
-
-        self._params = ParameterScratchpad(self.run_handle, str(params_path))
-        return self._params
-
-    def _allocate_buffers(self):
-        in_sz, out_sz, scratch_sz = self.op.buffer_sizes
-        self.input_buffer = XRTTensor((_n_elements(in_sz),), dtype=ml_dtypes.bfloat16)
-        self.output_buffer = XRTTensor((_n_elements(out_sz),), dtype=ml_dtypes.bfloat16)
-        self.scratch_buffer = XRTTensor(
-            (_n_elements(scratch_sz),), dtype=ml_dtypes.bfloat16
-        )
-
-    def get_buffer(self, buffer_name):
-        if buffer_name in self._buffer_cache:
-            return self._buffer_cache[buffer_name]
-        buf_type, offset, length = self.op.get_layout_for_buffer(buffer_name)
-        parent = {
-            "input": self.input_buffer,
-            "output": self.output_buffer,
-            "scratch": self.scratch_buffer,
-        }[buf_type]
-        sub = XRTSubBuffer(
-            parent_bo=parent.buffer_object(),
-            offset_bytes=offset,
-            size_bytes=length,
-            shape=(length // BF16.itemsize,),
-            dtype=ml_dtypes.bfloat16,
-            parent=parent,
-        )
-        self._buffer_cache[buffer_name] = sub
-        return sub
-
-    def _sync_inputs(self):
-        # Sub-views handed out by get_buffer() mark this parent host-dirty on .data
-        # access (XRTSubBuffer.data), so `to("npu")` here actually fires the host->device
-        # sync for the freshly written inputs.
-        self.input_buffer.to("npu")
-
-    def _sync_outputs(self):
-        # _run just rewrote the output arena on the device, so the device holds the
-        # authoritative copy. Force the device->host sync: assert device residency first
-        # so `to("cpu")` fires even if a prior read of get_buffer(...).data marked the
-        # buffer "cpu" (otherwise a looped dispatch would read stale output).
-        self.output_buffer.device = "npu"
-        self.output_buffer.to("cpu")
-
-    def _run(self):
-        self.run_handle.start()
-        ret_code = self.run_handle.wait()
-        if ret_code != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
-            raise RuntimeError(f"Kernel execution failed with return code {ret_code}")
 
 
 class _PerBufferCallable(SequenceCallable):
@@ -658,48 +572,51 @@ class SequenceXclbinCallable(_PerBufferCallable):
         super().__init__(op)
 
     def _make_buffer(self, n_elements):
-        return XRTTensor((n_elements,), dtype=ml_dtypes.bfloat16)
+        return aie_utils.tensor((n_elements,), dtype=ml_dtypes.bfloat16)
 
     def _make_subbuffer(self, parent, offset_bytes, size_bytes):
-        return XRTSubBuffer(
-            parent_bo=parent.buffer_object(),
-            offset_bytes=offset_bytes,
-            size_bytes=size_bytes,
-            shape=(size_bytes // BF16.itemsize,),
-            dtype=ml_dtypes.bfloat16,
-            parent=parent,
+        raise NotImplementedError(
+            "Sliced sequence buffers (buffer_name[start:end]) are not yet "
+            "supported on the HRX runtime: HRX dispatch bindings have no byte "
+            "offset and HRXTensor exposes no sub-view. Restructure the sequence "
+            "to use whole named buffers, or extend the HRX runtime to bind "
+            "hrx_buffer_ref_t offsets before using slice notation."
         )
 
     def _allocate_buffers(self):
         super()._allocate_buffers()
         dispatch = self._dispatch
-        combined_xclbin_path = dispatch.combined_xclbin.filename
-        self._op_callable_map = {}  # id(op) -> NPUKernel
+        runtime = aie_utils.DefaultNPURuntime
+        # Load each unique operator as its own amdxdna executable. The runlist
+        # is then submitted as a single batched HRX run_chain.
+        self._op_handle_map = {}  # id(op) -> KernelHandle
         for op_id, xclbin in dispatch.op_xclbin_map.items():
-            self._op_callable_map[op_id] = NPUKernel(
-                xclbin_path=combined_xclbin_path,
+            npu_kernel = NPUKernel(
+                xclbin_path=xclbin.filename,
                 kernel_name=dispatch.op_kernel_name_map[op_id],
                 insts_path=dispatch.op_insts_map[op_id].filename,
             )
+            self._op_handle_map[op_id] = runtime.load(npu_kernel)
         self._execution_plan = [
             (
-                self._op_callable_map[id(step_op)],
+                self._op_handle_map[id(step_op)],
                 [self._resolve_buffer(name) for name in buf_names],
             )
             for step_op, *buf_names in self.op.runlist
         ]
 
     def _run(self):
-        # Walk the execution plan alongside the resolved runlist steps; the
-        # per-step behaviour is delegated to _run_step so that compare mode can
-        # reuse this loop verbatim.
-        for step_idx, ((kernel, args), step) in enumerate(
-            zip(self._execution_plan, self._iter_steps())
-        ):
-            self._run_step(step_idx, kernel, args, step)
+        # Submit the whole runlist as one batched dispatch. HRX inserts an
+        # execution + memory barrier between chained dispatches, so a later
+        # operator observes an earlier one's device writes (producer -> consumer
+        # handoff through shared named buffers is correct).
+        aie_utils.DefaultNPURuntime.run_chain(list(self._execution_plan))
 
-    def _run_step(self, step_idx, kernel, args, step):
-        kernel(*args)
+    def _run_step(self, step_idx, handle, args, step):
+        # Per-step single dispatch, used by the compare path (which must read
+        # each operator's output back before the next runs). The batched _run
+        # above is preferred for normal execution.
+        aie_utils.DefaultNPURuntime.run(handle, args)
 
 
 def _reshape_for_spec(flat_tensor, spec):
@@ -759,19 +676,24 @@ class SequenceCompareCallable(SequenceXclbinCallable):
         return buf.torch_view()[:n].clone().reshape(spec.shape)
 
     def _run(self):
-        # Reset per-invocation stats, then reuse SequenceXclbinCallable._run's
-        # execution-plan loop; only the per-step behaviour (_run_step) differs.
+        # Compare mode cannot batch: it must read each operator's NPU output
+        # back and re-run its CPU reference before the next operator runs. So
+        # dispatch step-by-step (one run() per step) instead of a single
+        # run_chain, walking the execution plan alongside the resolved steps.
         self.last_step_stats = []
-        super()._run()
+        for step_idx, ((handle, args), step) in enumerate(
+            zip(self._execution_plan, self._iter_steps())
+        ):
+            self._run_step(step_idx, handle, args, step)
 
-    def _run_step(self, step_idx, kernel, args, step):
+    def _run_step(self, step_idx, handle, args, step):
         step_op, in_names, in_specs, out_name, out_spec = step
 
         cpu_inputs = [
             self._read_to_cpu(name, spec) for name, spec in zip(in_names, in_specs)
         ]
 
-        kernel(*args)
+        aie_utils.DefaultNPURuntime.run(handle, args)
 
         npu_out = self._read_to_cpu(out_name, out_spec).to(torch.float32)
         ref_out = step_op.reference(*cpu_inputs)
